@@ -1,15 +1,19 @@
 import os
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, BufferedInputFile
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    BufferedInputFile,
+)
 from aiogram.enums import ParseMode
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-import psycopg
 from psycopg_pool import AsyncConnectionPool
 
 logging.basicConfig(level=logging.INFO)
@@ -67,6 +71,11 @@ def now_utc():
     return datetime.now(timezone.utc)
 
 
+def fmt_dt(dt: datetime) -> str:
+    # tampilkan UTC agar konsisten (bisa kamu ubah ke WIB kalau mau)
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 # =========================
 # DB SCHEMA
 # =========================
@@ -80,15 +89,17 @@ CREATE TABLE IF NOT EXISTS tg_users (
     last_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- user memilih jalur support apa (aktif). user hanya boleh 1 session aktif.
 CREATE TABLE IF NOT EXISTS user_sessions (
     user_id     BIGINT PRIMARY KEY REFERENCES tg_users(user_id) ON DELETE CASCADE,
     category    TEXT NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- semua chat dicatat (direction bebas: user_to_admin/admin_to_user/system)
 CREATE TABLE IF NOT EXISTS chat_messages (
     id              BIGSERIAL PRIMARY KEY,
-    direction       TEXT NOT NULL,  -- 'user_to_admin' atau 'admin_to_user'
+    direction       TEXT NOT NULL,
     category        TEXT NOT NULL,
     user_id         BIGINT NOT NULL,
     admin_id        BIGINT NOT NULL,
@@ -98,6 +109,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- mapping: pesan yang dikirim ke admin (message_id admin) -> user mana
 CREATE TABLE IF NOT EXISTS admin_inbox_map (
     id                 BIGSERIAL PRIMARY KEY,
     admin_id           BIGINT NOT NULL,
@@ -108,12 +120,14 @@ CREATE TABLE IF NOT EXISTS admin_inbox_map (
     UNIQUE(admin_id, admin_message_id)
 );
 
+-- simpan setting file_id banner balasan
 CREATE TABLE IF NOT EXISTS bot_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- index pesan yang BOT kirim/forward/copy agar bisa delete best-effort saat endchat
 CREATE TABLE IF NOT EXISTS tg_message_index (
     id BIGSERIAL PRIMARY KEY,
     user_id BIGINT NOT NULL,
@@ -121,6 +135,25 @@ CREATE TABLE IF NOT EXISTS tg_message_index (
     chat_id BIGINT NOT NULL,
     message_id BIGINT NOT NULL,
     role TEXT NOT NULL, -- 'admin' atau 'user'
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- banned users 1 hari
+CREATE TABLE IF NOT EXISTS banned_users (
+    user_id BIGINT PRIMARY KEY,
+    banned_until TIMESTAMPTZ NOT NULL,
+    reason TEXT NOT NULL,
+    banned_by BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- pending action untuk admin (mis. menunggu alasan ban)
+CREATE TABLE IF NOT EXISTS admin_pending_actions (
+    admin_id BIGINT PRIMARY KEY,
+    action TEXT NOT NULL,              -- 'ban_reason'
+    target_user_id BIGINT NOT NULL,
+    category TEXT NOT NULL,
+    ref_admin_message_id BIGINT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -190,9 +223,15 @@ async def get_user_category(user_id: int) -> str | None:
             return row[0] if row else None
 
 
-async def log_message(direction: str, category: str, user_id: int, admin_id: int,
-                      text: str | None, tg_message_id: int | None = None,
-                      tg_reply_to_id: int | None = None):
+async def log_message(
+    direction: str,
+    category: str,
+    user_id: int,
+    admin_id: int,
+    text: str | None,
+    tg_message_id: int | None = None,
+    tg_reply_to_id: int | None = None,
+):
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -284,12 +323,11 @@ async def get_transcript_text(user_id: int) -> str:
             )
             rows = await cur.fetchall()
 
-    lines = []
+    lines: list[str] = []
     for created_at, direction, category, text in rows:
         ts = created_at.strftime("%Y-%m-%d %H:%M:%S")
-        who = "USER→ADMIN" if direction == "user_to_admin" else "ADMIN→USER"
         cat = CATEGORY_LABEL.get(category, category)
-        lines.append(f"[{ts}] [{cat}] {who}: {text}")
+        lines.append(f"[{ts}] [{cat}] {direction}: {text}")
     return "\n".join(lines) if lines else "(no messages)"
 
 
@@ -300,7 +338,128 @@ async def cleanup_user_data(user_id: int):
             await cur.execute("DELETE FROM admin_inbox_map WHERE user_id=%s", (user_id,))
             await cur.execute("DELETE FROM chat_messages WHERE user_id=%s", (user_id,))
             await cur.execute("DELETE FROM tg_message_index WHERE user_id=%s", (user_id,))
+            await cur.execute("DELETE FROM banned_users WHERE user_id=%s", (user_id,))
+            await cur.execute("DELETE FROM admin_pending_actions WHERE target_user_id=%s", (user_id,))
         await conn.commit()
+
+
+# ---------- BAN ----------
+async def get_active_ban(user_id: int):
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT banned_until, reason, banned_by FROM banned_users WHERE user_id=%s",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+
+    if not row:
+        return None
+
+    banned_until, reason, banned_by = row
+    if banned_until <= now_utc():
+        # ban expired -> cleanup
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM banned_users WHERE user_id=%s", (user_id,))
+            await conn.commit()
+        return None
+
+    return {"banned_until": banned_until, "reason": reason, "banned_by": banned_by}
+
+
+async def set_ban_1day(user_id: int, admin_id: int, reason: str):
+    until = now_utc() + timedelta(days=1)
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO banned_users(user_id, banned_until, reason, banned_by)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE
+                SET banned_until=EXCLUDED.banned_until,
+                    reason=EXCLUDED.reason,
+                    banned_by=EXCLUDED.banned_by,
+                    created_at=NOW()
+                """,
+                (user_id, until, reason, admin_id),
+            )
+        await conn.commit()
+    return until
+
+
+async def set_pending_action(admin_id: int, action: str, target_user_id: int, category: str, ref_admin_message_id: int | None):
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO admin_pending_actions(admin_id, action, target_user_id, category, ref_admin_message_id, created_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (admin_id) DO UPDATE
+                SET action=EXCLUDED.action,
+                    target_user_id=EXCLUDED.target_user_id,
+                    category=EXCLUDED.category,
+                    ref_admin_message_id=EXCLUDED.ref_admin_message_id,
+                    created_at=NOW()
+                """,
+                (admin_id, action, target_user_id, category, ref_admin_message_id),
+            )
+        await conn.commit()
+
+
+async def pop_pending_action(admin_id: int):
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT action, target_user_id, category, ref_admin_message_id FROM admin_pending_actions WHERE admin_id=%s",
+                (admin_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+            await cur.execute("DELETE FROM admin_pending_actions WHERE admin_id=%s", (admin_id,))
+        await conn.commit()
+    action, target_user_id, category, ref_admin_message_id = row
+    return {
+        "action": action,
+        "target_user_id": target_user_id,
+        "category": category,
+        "ref_admin_message_id": ref_admin_message_id,
+    }
+
+
+# =========================
+# UI KEYBOARDS
+# =========================
+def kb_user_pick_or_end(active_category: str | None):
+    kb = InlineKeyboardBuilder()
+
+    if active_category:
+        kb.button(text=f"✅ Aktif: {CATEGORY_LABEL.get(active_category, active_category)}", callback_data="noop")
+        kb.button(text="🛑 End Chat", callback_data="user:endchat")
+        kb.adjust(1, 1)
+        return kb.as_markup()
+
+    kb.button(text="🌐 Web Support", callback_data="pick:websupport")
+    kb.button(text="📣 Advertise", callback_data="pick:advertise")
+    kb.button(text="🚨 Report Link", callback_data="pick:reportlink")
+    kb.adjust(1, 1, 1)
+    return kb.as_markup()
+
+
+def kb_admin_incoming(user_id: int, category: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🛑 End Chat", callback_data=f"admin:endchat:{user_id}")
+    kb.button(text="⛔ Block 1 hari", callback_data=f"admin:block:{user_id}:{category}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+def kb_admin_panel():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🖼️ Set Foto Balasan (kirim foto + caption)", callback_data="admin:how_setphoto")
+    kb.adjust(1)
+    return kb.as_markup()
 
 
 # =========================
@@ -318,55 +477,187 @@ def build_user_identity(m: Message) -> str:
 
 
 # =========================
-# COMMANDS
+# START (welcome only for non-admin)
 # =========================
 @dp.message(CommandStart())
 async def cmd_start(m: Message):
     await upsert_user(m)
 
     if m.from_user.id in ADMINS:
-        await m.answer(
+        txt = (
             "✅ <b>Admin Panel</b>\n"
-            "Cara pakai:\n"
-            "• User pilih /websupport /advertise /reportlink\n"
-            "• Kamu tinggal <b>reply</b> pesan INCOMING untuk balas user\n"
-            "• Akhiri chat: <b>/endchat</b> (reply ke pesan user)\n"
-            "• Set foto balasan: kirim foto + /setreplyphoto"
+            "• Balas (reply) pesan <b>INCOMING</b> untuk menjawab user\n"
+            "• Gunakan tombol <b>Block 1 hari</b> / <b>End Chat</b> di pesan INCOMING\n"
+            "• Set foto balasan: kirim foto landscape 320×180 ke bot dengan caption <b>/setreplyphoto</b>\n"
         )
+        await m.answer(txt, reply_markup=kb_admin_panel())
         return
 
-    text = (
+    active = await get_user_category(m.from_user.id)
+    if active:
+        txt = (
+            f"👋 Halo! Ini <b>{SUPPORT_BRAND}</b> via Telegram.\n\n"
+            f"Kamu sedang berada di sesi: <b>{CATEGORY_LABEL.get(active, active)}</b>\n"
+            "Untuk pindah tujuan, kamu wajib <b>End Chat</b> dulu."
+        )
+        await m.answer(txt, reply_markup=kb_user_pick_or_end(active))
+        return
+
+    txt = (
         f"👋 Halo! Ini <b>{SUPPORT_BRAND}</b> via Telegram.\n\n"
-        "Sebelum chat masuk ke admin, pilih dulu tujuan kamu:\n"
-        "• /websupport — kendala website Bicolink\n"
-        "• /advertise — mau beriklan di jaringan website Bicolink\n"
-        "• /reportlink — lapor link/konten\n\n"
-        "Setelah memilih, kirim pesan kamu seperti biasa."
+        "Sebelum chat masuk ke admin, pilih dulu tujuan kamu (1 saja):"
     )
-    await m.answer(text)
+    await m.answer(txt, reply_markup=kb_user_pick_or_end(None))
 
 
-@dp.message(Command("websupport"))
-async def cmd_websupport(m: Message):
-    await upsert_user(m)
-    await set_user_category(m.from_user.id, CATEGORY_WEB)
-    await m.answer("✅ Oke! Kamu masuk ke <b>Web Support</b>. Silakan tulis kendalanya ya.")
+# =========================
+# USER PICK CATEGORY (buttons)
+# =========================
+@dp.callback_query(F.data.startswith("pick:"))
+async def user_pick_category(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    if user_id in ADMINS:
+        await cb.answer("Admin tidak perlu memilih kategori.", show_alert=True)
+        return
+
+    await upsert_user(cb.message)  # safe: message has from_user
+
+    current = await get_user_category(user_id)
+    if current:
+        await cb.answer("Kamu sudah punya sesi aktif. End Chat dulu untuk pindah.", show_alert=True)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=kb_user_pick_or_end(current))
+        except Exception:
+            pass
+        return
+
+    category = cb.data.split(":", 1)[1].strip()
+    if category not in CATEGORY_TO_ADMIN:
+        await cb.answer("Kategori tidak valid.", show_alert=True)
+        return
+
+    await set_user_category(user_id, category)
+    await cb.answer("✅ Berhasil dipilih.", show_alert=False)
+
+    msg = (
+        f"✅ Oke! Kamu masuk ke <b>{CATEGORY_LABEL.get(category, category)}</b>.\n"
+        "Silakan tulis pesan kamu sekarang."
+    )
+    try:
+        await cb.message.edit_text(msg, reply_markup=kb_user_pick_or_end(category))
+    except Exception:
+        await cb.message.answer(msg, reply_markup=kb_user_pick_or_end(category))
 
 
-@dp.message(Command("advertise"))
-async def cmd_advertise(m: Message):
-    await upsert_user(m)
-    await set_user_category(m.from_user.id, CATEGORY_ADS)
-    await m.answer("✅ Oke! Kamu masuk ke <b>Advertiser Specialist</b>. Silakan jelaskan kebutuhan iklannya.")
+@dp.callback_query(F.data == "noop")
+async def noop(cb: CallbackQuery):
+    await cb.answer()
 
 
-@dp.message(Command("reportlink"))
-async def cmd_reportlink(m: Message):
-    await upsert_user(m)
-    await set_user_category(m.from_user.id, CATEGORY_REPORT)
-    await m.answer("✅ Oke! Kamu masuk ke <b>Report Link/Content</b>. Kirim detail link/konten yang mau dilaporkan.")
+# =========================
+# USER END CHAT (button)
+# =========================
+@dp.callback_query(F.data == "user:endchat")
+async def user_endchat_button(cb: CallbackQuery):
+    if cb.from_user.id in ADMINS:
+        await cb.answer("Admin tidak pakai tombol ini.", show_alert=True)
+        return
+    await cb.answer()
+    await end_chat_for_user(
+        actor_id=cb.from_user.id,
+        target_user_id=cb.from_user.id,
+        actor_is_admin=False,
+        notify_actor_chat_id=cb.from_user.id,
+    )
+    try:
+        await cb.message.edit_text(
+            "✅ Chat kamu sudah diakhiri.\nKlik /start untuk mulai lagi.",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
 
 
+# =========================
+# ADMIN BUTTONS (End Chat / Block)
+# =========================
+@dp.callback_query(F.data.startswith("admin:endchat:"))
+async def admin_endchat_button(cb: CallbackQuery):
+    if cb.from_user.id not in ADMINS:
+        await cb.answer("Khusus admin.", show_alert=True)
+        return
+    await cb.answer()
+
+    try:
+        target_user_id = int(cb.data.split(":")[2])
+    except Exception:
+        await cb.answer("Data invalid.", show_alert=True)
+        return
+
+    await end_chat_for_user(
+        actor_id=cb.from_user.id,
+        target_user_id=target_user_id,
+        actor_is_admin=True,
+        notify_actor_chat_id=cb.from_user.id,
+    )
+
+    # delete the admin message bubble that has the buttons (best effort)
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("admin:block:"))
+async def admin_block_button(cb: CallbackQuery):
+    if cb.from_user.id not in ADMINS:
+        await cb.answer("Khusus admin.", show_alert=True)
+        return
+    await cb.answer()
+
+    parts = cb.data.split(":")
+    # admin:block:<user_id>:<category>
+    if len(parts) < 4:
+        await cb.answer("Data invalid.", show_alert=True)
+        return
+
+    target_user_id = int(parts[2])
+    category = parts[3]
+
+    # simpan pending action: menunggu alasan
+    await set_pending_action(
+        admin_id=cb.from_user.id,
+        action="ban_reason",
+        target_user_id=target_user_id,
+        category=category,
+        ref_admin_message_id=cb.message.message_id if cb.message else None,
+    )
+
+    await cb.message.answer(
+        f"⛔ <b>Block 1 hari</b>\n"
+        f"Target: <code>{target_user_id}</code>\n\n"
+        "Silakan kirim <b>alasan</b> (1 pesan) sekarang.\n"
+        "Contoh: <i>spam / bahasa kasar / flood</i>",
+    )
+
+
+@dp.callback_query(F.data == "admin:how_setphoto")
+async def admin_how_setphoto(cb: CallbackQuery):
+    if cb.from_user.id not in ADMINS:
+        await cb.answer("Khusus admin.", show_alert=True)
+        return
+    await cb.answer()
+    await cb.message.answer(
+        "Untuk set foto kecil 320×180 yang ikut di setiap balasan admin:\n"
+        "1) Kirim foto landscape 320×180 ke bot\n"
+        "2) Isi caption: <b>/setreplyphoto</b>\n"
+        "Selesai ✅"
+    )
+
+
+# =========================
+# SET REPLY PHOTO (still command; button-only for selection, not for file-id)
+# =========================
 @dp.message(Command("setreplyphoto"))
 async def set_reply_photo(m: Message):
     if m.from_user.id not in ADMINS:
@@ -381,24 +672,10 @@ async def set_reply_photo(m: Message):
     await m.answer("✅ Foto balasan berhasil diset. Semua reply admin ke user akan pakai foto ini.")
 
 
-@dp.message(Command("endchat"))
-async def end_chat(m: Message):
-    target_user_id = None
-    category = None
-
-    if m.from_user.id in ADMINS:
-        if not m.reply_to_message:
-            await m.answer("⚠️ Admin: pakai <b>/endchat</b> dengan cara <b>reply</b> ke pesan INCOMING user.")
-            return
-        target_user_id, category = await resolve_reply_target(m.from_user.id, m.reply_to_message.message_id)
-        if not target_user_id:
-            await m.answer("⚠️ Tidak bisa menentukan user. Pastikan reply ke pesan yang bot kirim/forward.")
-            return
-    else:
-        target_user_id = m.from_user.id
-        category = await get_user_category(target_user_id) or CATEGORY_WEB  # fallback label
-
-    transcript = await get_transcript_text(target_user_id)
+# =========================
+# CORE: END CHAT (archive -> delete best-effort -> wipe DB)
+# =========================
+async def archive_to_channel(target_user_id: int, transcript: str, extra_caption: str | None = None):
     transcript_bytes = transcript.encode("utf-8", errors="ignore")
     bio = BytesIO(transcript_bytes)
     bio.seek(0)
@@ -406,17 +683,25 @@ async def end_chat(m: Message):
     filename = f"bicolink_chat_{target_user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     doc = BufferedInputFile(bio.read(), filename=filename)
 
+    caption = f"📦 <b>Chat Archive</b>\nUser ID: <code>{target_user_id}</code>"
+    if extra_caption:
+        caption += f"\n{extra_caption}"
+
     await bot.send_document(
         chat_id=ARCHIVE_CHANNEL_ID,
         document=doc,
-        caption=f"📦 <b>Chat Archive</b>\nUser ID: <code>{target_user_id}</code>",
-        parse_mode=ParseMode.HTML
+        caption=caption,
+        parse_mode=ParseMode.HTML,
     )
 
-    # delete messages bot can (best effort)
+
+async def delete_indexed_messages(target_user_id: int) -> int:
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute("SELECT chat_id, message_id FROM tg_message_index WHERE user_id=%s", (target_user_id,))
+            await cur.execute(
+                "SELECT chat_id, message_id FROM tg_message_index WHERE user_id=%s",
+                (target_user_id,),
+            )
             rows = await cur.fetchall()
 
     deleted = 0
@@ -426,39 +711,87 @@ async def end_chat(m: Message):
             deleted += 1
         except Exception:
             pass
+    return deleted
 
+
+async def end_chat_for_user(
+    actor_id: int,
+    target_user_id: int,
+    actor_is_admin: bool,
+    notify_actor_chat_id: int,
+):
+    # transcript from DB
+    transcript = await get_transcript_text(target_user_id)
+
+    # archive (single bubble = 1 file)
+    await archive_to_channel(
+        target_user_id=target_user_id,
+        transcript=transcript,
+        extra_caption=f"Ended by: <code>{actor_id}</code>",
+    )
+
+    # delete messages best-effort (bot-sent/forwarded)
+    deleted = await delete_indexed_messages(target_user_id)
+
+    # wipe DB data for user (including ban and pending)
     await cleanup_user_data(target_user_id)
 
-    if m.from_user.id in ADMINS:
-        await m.answer(
-            f"✅ Chat user <code>{target_user_id}</code> diakhiri.\n"
-            f"Arsip masuk channel.\n"
-            f"Deleted (best effort): {deleted}"
+    # notify actor
+    if actor_is_admin:
+        await bot.send_message(
+            notify_actor_chat_id,
+            f"✅ End Chat sukses untuk user <code>{target_user_id}</code>.\n"
+            f"Arsip sudah masuk channel.\n"
+            f"Deleted (best effort): {deleted}",
         )
+        # notify user
         try:
-            await bot.send_message(target_user_id, "✅ Chat kamu sudah diakhiri. Terima kasih! Kalau perlu bantuan lagi, /start ya.")
+            await bot.send_message(
+                target_user_id,
+                "✅ Chat kamu sudah diakhiri.\nKalau perlu bantuan lagi, tekan /start ya.",
+            )
         except Exception:
             pass
     else:
-        await m.answer("✅ Chat kamu sudah diakhiri. Terima kasih! Kalau perlu bantuan lagi, /start ya.")
+        # user end chat
+        try:
+            await bot.send_message(
+                notify_actor_chat_id,
+                "✅ Chat kamu sudah diakhiri.\nKalau perlu bantuan lagi, tekan /start ya.",
+            )
+        except Exception:
+            pass
 
 
 # =========================
-# ROUTERS
+# USER -> ADMIN ROUTER
 # =========================
-
-# USER -> ADMIN
 @dp.message(F.from_user.id.not_in(ADMINS))
 async def user_message_router(m: Message):
     await upsert_user(m)
 
-    # ignore bot commands (handled elsewhere)
+    # block check
+    ban = await get_active_ban(m.from_user.id)
+    if ban:
+        until = ban["banned_until"]
+        reason = ban["reason"]
+        await m.answer(
+            "⛔ <b>Akun kamu sedang dibatasi</b>\n"
+            f"Durasi: sampai <b>{fmt_dt(until)}</b>\n"
+            f"Alasan: <i>{reason}</i>\n\n"
+            "Jika kamu merasa ini keliru, silakan coba lagi setelah masa blokir selesai.",
+        )
+        return
+
+    # ignore commands (we don't advertise; but still allow /start)
     if m.text and m.text.startswith("/"):
         return
 
     category = await get_user_category(m.from_user.id)
     if not category:
-        await m.answer("⚠️ Pilih dulu tujuan chat: /websupport atau /advertise atau /reportlink")
+        await m.answer(
+            "⚠️ Kamu belum memilih tujuan.\nKlik /start lalu pilih salah satu tombol."
+        )
         return
 
     admin_id = CATEGORY_TO_ADMIN[category]
@@ -472,8 +805,13 @@ async def user_message_router(m: Message):
         f"— — —\n"
     )
 
+    # Send to admin with action buttons (End Chat / Block 1 day)
     if m.text:
-        sent = await bot.send_message(admin_id, header + m.text)
+        sent = await bot.send_message(
+            admin_id,
+            header + m.text,
+            reply_markup=kb_admin_incoming(m.from_user.id, category),
+        )
         await map_admin_message(admin_id, sent.message_id, m.from_user.id, category)
         await index_bot_message(m.from_user.id, category, admin_id, sent.message_id, "admin")
 
@@ -487,8 +825,12 @@ async def user_message_router(m: Message):
         )
         return
 
-    # media / non-text
-    sent_header = await bot.send_message(admin_id, header + "<i>[media/message forwarded below]</i>")
+    # media / non-text: send header + forward
+    sent_header = await bot.send_message(
+        admin_id,
+        header + "<i>[media/message forwarded below]</i>",
+        reply_markup=kb_admin_incoming(m.from_user.id, category),
+    )
     await map_admin_message(admin_id, sent_header.message_id, m.from_user.id, category)
     await index_bot_message(m.from_user.id, category, admin_id, sent_header.message_id, "admin")
 
@@ -506,15 +848,71 @@ async def user_message_router(m: Message):
     )
 
 
-# ADMIN -> USER (must reply)
+# =========================
+# ADMIN: capture pending ban reason
+# =========================
 @dp.message(F.from_user.id.in_(ADMINS))
-async def admin_reply_handler(m: Message):
-    # allow /setreplyphoto and /endchat commands handled already
+async def admin_message_handler(m: Message):
+    # ignore commands except /setreplyphoto (handled) and /start (handled)
     if m.text and m.text.startswith("/"):
         return
 
+    pending = await pop_pending_action(m.from_user.id)
+    if pending and pending["action"] == "ban_reason":
+        target_user_id = int(pending["target_user_id"])
+        category = pending["category"]
+        reason = (m.text or "").strip()
+
+        if not reason:
+            await m.answer("⚠️ Alasan tidak boleh kosong. Klik Block lagi kalau mau ulang.")
+            return
+
+        banned_until = await set_ban_1day(target_user_id, m.from_user.id, reason)
+
+        # log system event
+        await log_message(
+            direction="system",
+            category=category,
+            user_id=target_user_id,
+            admin_id=m.from_user.id,
+            text=f"USER BLOCKED 1 DAY until {fmt_dt(banned_until)} | reason: {reason}",
+        )
+
+        # archive ban event to channel (single bubble message)
+        await bot.send_message(
+            ARCHIVE_CHANNEL_ID,
+            (
+                "⛔ <b>Ban Event</b>\n"
+                f"User ID: <code>{target_user_id}</code>\n"
+                f"Category: <b>{CATEGORY_LABEL.get(category, category)}</b>\n"
+                f"Banned by: <code>{m.from_user.id}</code>\n"
+                f"Until: <b>{fmt_dt(banned_until)}</b>\n"
+                f"Reason: <i>{reason}</i>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+        # notify admin + user
+        await m.answer(
+            f"✅ User <code>{target_user_id}</code> diblokir 1 hari.\n"
+            f"Sampai: <b>{fmt_dt(banned_until)}</b>\n"
+            f"Alasan: <i>{reason}</i>"
+        )
+        try:
+            await bot.send_message(
+                target_user_id,
+                "⛔ <b>Kamu diblokir dari support selama 1 hari</b>\n"
+                f"Sampai: <b>{fmt_dt(banned_until)}</b>\n"
+                f"Alasan: <i>{reason}</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
+    # If not pending, treat as normal admin reply (must reply)
     if not m.reply_to_message:
-        await m.answer("⚠️ Balas (reply) pesan user yang mau kamu jawab, biar bot tau target user-nya.")
+        await m.answer("⚠️ Balas (reply) pesan INCOMING user untuk menjawab user.")
         return
 
     admin_id = m.from_user.id
@@ -522,7 +920,7 @@ async def admin_reply_handler(m: Message):
 
     user_id, category = await resolve_reply_target(admin_id, replied_id)
     if not user_id:
-        await m.answer("⚠️ Target user tidak ditemukan. Pastikan reply ke pesan yang bot kirim/forward.")
+        await m.answer("⚠️ Target user tidak ditemukan. Reply ke pesan yang bot kirim/forward.")
         return
 
     expected_admin = CATEGORY_TO_ADMIN.get(category)
@@ -533,18 +931,19 @@ async def admin_reply_handler(m: Message):
     reply_photo_file_id = await get_setting("reply_photo_file_id")
     prefix = f"💬 <b>{CATEGORY_LABEL.get(category, category)}</b>\n"
 
+    # If user got banned after incoming, still allow admin to reply (opsional).
     if m.text:
         if reply_photo_file_id:
             sent_u = await bot.send_photo(
                 chat_id=user_id,
                 photo=reply_photo_file_id,
                 caption=prefix + m.text,
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
             )
         else:
             sent_u = await bot.send_message(user_id, prefix + m.text)
 
-        # index message in user chat so it can be deleted later (best effort)
+        # index bot message in user chat for best-effort delete on endchat
         await index_bot_message(user_id, category, user_id, sent_u.message_id, "user")
 
         await log_message(
@@ -558,9 +957,8 @@ async def admin_reply_handler(m: Message):
         )
         return
 
-    # Non-text from admin -> user
+    # admin sends media -> user
     copied = await bot.copy_message(chat_id=user_id, from_chat_id=m.chat.id, message_id=m.message_id)
-    # copied is Message in aiogram 3
     try:
         await index_bot_message(user_id, category, user_id, copied.message_id, "user")
     except Exception:
@@ -574,6 +972,36 @@ async def admin_reply_handler(m: Message):
         text=m.caption or "[non-text message]",
         tg_message_id=m.message_id,
         tg_reply_to_id=replied_id,
+    )
+
+
+# =========================
+# OPTIONAL: keep /endchat command as fallback (not advertised)
+# =========================
+@dp.message(Command("endchat"))
+async def endchat_command_fallback(m: Message):
+    if m.from_user.id in ADMINS:
+        if not m.reply_to_message:
+            await m.answer("Admin: /endchat harus reply ke pesan INCOMING user.")
+            return
+        target_user_id, _cat = await resolve_reply_target(m.from_user.id, m.reply_to_message.message_id)
+        if not target_user_id:
+            await m.answer("Target user tidak ditemukan.")
+            return
+        await end_chat_for_user(
+            actor_id=m.from_user.id,
+            target_user_id=target_user_id,
+            actor_is_admin=True,
+            notify_actor_chat_id=m.from_user.id,
+        )
+        return
+
+    # user end chat dirinya sendiri
+    await end_chat_for_user(
+        actor_id=m.from_user.id,
+        target_user_id=m.from_user.id,
+        actor_is_admin=False,
+        notify_actor_chat_id=m.from_user.id,
     )
 
 
