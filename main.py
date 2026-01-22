@@ -59,9 +59,9 @@ CATEGORY_TO_ADMIN = {
 }
 
 CATEGORY_LABEL = {
-    CATEGORY_WEB: "🌐 Web Support",
-    CATEGORY_ADS: "📣 Advertise Specialist",
-    CATEGORY_REPORT: "🚨 Report Link/Content",
+    CATEGORY_WEB: "🌐 Nabila Web Specialist",
+    CATEGORY_ADS: "📣 Renbi Advertising Specialist",
+    CATEGORY_REPORT: "🚨 Youbi Content Specialist",
 }
 
 # =========================
