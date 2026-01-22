@@ -16,14 +16,14 @@ logging.basicConfig(level=logging.INFO)
 # =========================
 # ENV CONFIG (Railway)
 # =========================
-BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "8342328997:AAE3mlEIL3Aw9Bdo24yRS-Q_WXtYc74P0p8").strip()
+DATABASE_URL = (os.getenv("DATABASE_URL") or "postgresql://postgres:FsGCNVcYUsxUodNDsCgbMNXigMBJkpMR@switchback.proxy.rlwy.net:18615/railway").strip()
 
-ADMIN_WEB_ID = int(os.getenv("ADMIN_WEB_ID", "0"))
-ADMIN_ADS_ID = int(os.getenv("ADMIN_ADS_ID", "0"))
-ADMIN_REPORT_ID = int(os.getenv("ADMIN_REPORT_ID", "0"))
+ADMIN_WEB_ID = int(os.getenv("ADMIN_WEB_ID", "960048629"))
+ADMIN_ADS_ID = int(os.getenv("ADMIN_ADS_ID", "5513998345"))
+ADMIN_REPORT_ID = int(os.getenv("ADMIN_REPORT_ID", "5577603728"))
 
-ARCHIVE_CHANNEL_ID = int(os.getenv("ARCHIVE_CHANNEL_ID", "0"))  # -100xxxxxxx (bot must be admin)
+ARCHIVE_CHANNEL_ID = int(os.getenv("ARCHIVE_CHANNEL_ID", "-1003614003005"))  # -100xxxxxxx
 SUPPORT_BRAND = (os.getenv("SUPPORT_BRAND") or "Bicolink Support").strip()
 
 if not BOT_TOKEN:
