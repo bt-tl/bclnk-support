@@ -964,8 +964,10 @@ async def do_endchat(target_user_id: int, ended_by: int, category_hint: str | No
     try:
         msg = await bot.send_message(
             target_user_id,
-            "✅ Chat kamu sudah diakhiri.\n\n"
-            "Sebelum chat lagi, cek komunitas & tutorial Bicolink dulu ya 👇",
+            "✅ Chat kamu sudah diakhiri.\n"
+            "Jangan lupa gabung channel dan grup komunitas untuk mengobrol dengan pengguna lain & tonton juga tutorial Bicolink di youtube 👇\n\n"
+            "✅ Your chat has been ended.\n"
+            "Don't forget to join our channel and community group to chat with other users & also watch Bicolink tutorials on YouTube 👇\n\n",
             reply_markup=kb_after_endchat_social()
         )
         # index so it can be deleted on next endchat (best effort)
