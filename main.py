@@ -489,7 +489,7 @@ async def send_user_menu(user_id: int, note: str | None = None):
     text = (
         f"👋 Selamat datang di <b>{SUPPORT_BRAND}</b> via Telegram.\n"
         "Silahkan pilih kategori tujuan kamu. Kamu akan di hubungkan dengan support sesuai spesialisasi kategori (hanya 1 tiap sesi)\n\n"
-        "👋 Welcome to <b>{SUPPORT_BRAND}</b> via Telegram.\n"
+        f"👋 Welcome to <b>{SUPPORT_BRAND}</b> via Telegram.\n"
         "Please select your destination category. You will be connected with a support specialist based on your chosen category (only 1 per session)"
     )
     if note:
@@ -611,7 +611,7 @@ async def pick_category(q: CallbackQuery):
         f"✅ Halo, sekarang kamu terhubung dengan <b>{CATEGORY_LABEL.get(category, category)}</b>.\n"
         "Silakan tulis pesan kamu. Jika sudah selesai, tekan <b>End Chat</b>.\n\n"
         "✅ Hello, you are now connected to <b>{CATEGORY_LABEL.get(category, category)}</b>.\n"
-        "Please type your message. Once you're done, press <b>End Chat</b>.",
+        f"Please type your message. Once you're done, press <b>End Chat</b>.",
         reply_markup=kb_user_endchat()
     )
     await index_message(user_id, category, user_id, msg.message_id, "user_bot")
