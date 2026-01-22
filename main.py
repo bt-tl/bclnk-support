@@ -16,23 +16,23 @@ logging.basicConfig(level=logging.INFO)
 # =========================
 # ENV CONFIG (Railway)
 # =========================
-BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "8342328997:AAE3mlEIL3Aw9Bdo24yRS-Q_WXtYc74P0p8").strip()
+DATABASE_URL = (os.getenv("DATABASE_URL") or "postgresql://postgres:FsGCNVcYUsxUodNDsCgbMNXigMBJkpMR@switchback.proxy.rlwy.net:18615/railway").strip()
 
-ADMIN_WEB_ID = int(os.getenv("ADMIN_WEB_ID", "0"))
-ADMIN_ADS_ID = int(os.getenv("ADMIN_ADS_ID", "0"))
-ADMIN_REPORT_ID = int(os.getenv("ADMIN_REPORT_ID", "0"))
+ADMIN_WEB_ID = int(os.getenv("ADMIN_WEB_ID", "960048629"))
+ADMIN_ADS_ID = int(os.getenv("ADMIN_ADS_ID", "960048629"))
+ADMIN_REPORT_ID = int(os.getenv("ADMIN_REPORT_ID", "960048629"))
 
-ARCHIVE_CHANNEL_ID = int(os.getenv("ARCHIVE_CHANNEL_ID", "0"))  # -100xxxxxxx (bot must be admin)
+ARCHIVE_CHANNEL_ID = int(os.getenv("ARCHIVE_CHANNEL_ID", "-1003614003005"))  # -100xxxxxxx (bot must be admin)
 SUPPORT_BRAND = (os.getenv("SUPPORT_BRAND") or "Bicolink Support").strip()
 
 # Social links (set these in Railway Environment Variables)
-SOCIAL_TG_CHANNEL = (os.getenv("SOCIAL_TG_CHANNEL") or "").strip()  # https://t.me/xxxx
-SOCIAL_TG_GROUP = (os.getenv("SOCIAL_TG_GROUP") or "").strip()      # https://t.me/xxxx
-SOCIAL_YOUTUBE = (os.getenv("SOCIAL_YOUTUBE") or "").strip()        # https://youtube.com/...
-SOCIAL_TIKTOK = (os.getenv("SOCIAL_TIKTOK") or "").strip()          # https://tiktok.com/@...
-SOCIAL_FACEBOOK = (os.getenv("SOCIAL_FACEBOOK") or "").strip()      # https://facebook.com/...
-SOCIAL_TWITTER = (os.getenv("SOCIAL_TWITTER") or "").strip()        # https://x.com/... or https://twitter.com/...
+SOCIAL_TG_CHANNEL = (os.getenv("SOCIAL_TG_CHANNEL") or "https://t.me/bicolinks").strip()  # https://t.me/xxxx
+SOCIAL_TG_GROUP = (os.getenv("SOCIAL_TG_GROUP") or "https://t.me/bicolink").strip()      # https://t.me/xxxx
+SOCIAL_YOUTUBE = (os.getenv("SOCIAL_YOUTUBE") or "https://www.youtube.com/@bicolink_official").strip()        # https://youtube.com/...
+SOCIAL_TIKTOK = (os.getenv("SOCIAL_TIKTOK") or "https://www.tiktok.com/@bicolink_official").strip()          # https://tiktok.com/@...
+SOCIAL_FACEBOOK = (os.getenv("SOCIAL_FACEBOOK") or "https://www.facebook.com/bicolink").strip()      # https://facebook.com/...
+SOCIAL_TWITTER = (os.getenv("SOCIAL_TWITTER") or "https://x.com/bicolink").strip()        # https://x.com/... or https://twitter.com/...
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN belum di-set.")
