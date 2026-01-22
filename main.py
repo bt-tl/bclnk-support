@@ -610,8 +610,8 @@ async def pick_category(q: CallbackQuery):
         user_id,
         f"✅ Halo, sekarang kamu terhubung dengan <b>{CATEGORY_LABEL.get(category, category)}</b>.\n"
         "Silakan tulis pesan kamu. Jika sudah selesai, tekan <b>End Chat</b>.\n\n"
-        "✅ Hello, you are now connected to <b>{CATEGORY_LABEL.get(category, category)}</b>.\n"
-        f"Please type your message. Once you're done, press <b>End Chat</b>.",
+        f"✅ Hello, you are now connected to <b>{CATEGORY_LABEL.get(category, category)}</b>.\n"
+        "Please type your message. Once you're done, press <b>End Chat</b>.",
         reply_markup=kb_user_endchat()
     )
     await index_message(user_id, category, user_id, msg.message_id, "user_bot")
