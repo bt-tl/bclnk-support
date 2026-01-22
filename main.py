@@ -787,7 +787,7 @@ async def admin_message_handler(m: Message):
 
     # ambil banner per kategori
     reply_photo_file_id = await get_setting(setting_key_reply_photo(category))
-    prefix = f"💬 <b>{CATEGORY_LABEL.get(category, category)}</b>\n"
+    prefix = f"<b>{CATEGORY_LABEL.get(category, category)}</b>\n\n💬 "
 
     # index pesan admin (human) di sisi admin supaya bisa dihapus saat endchat
     await index_message(user_id, category, admin_id, m.message_id, "admin_user")
