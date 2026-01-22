@@ -487,8 +487,10 @@ def build_user_identity(m: Message) -> str:
 
 async def send_user_menu(user_id: int, note: str | None = None):
     text = (
-        f"👋 Halo! Ini <b>{SUPPORT_BRAND}</b> via Telegram.\n\n"
-        "Sebelum chat masuk ke admin, pilih dulu tujuan kamu (hanya boleh 1):"
+        f"👋 Selamat datang di <b>{SUPPORT_BRAND}</b> via Telegram.\n"
+        "Silahkan pilih kategori tujuan kamu. Kamu akan di hubungkan dengan support sesuai spesialisasi kategori (hanya 1 tiap sesi)\n\n"
+        "👋 Welcome to <b>{SUPPORT_BRAND}</b> via Telegram.\n"
+        "Please select your destination category. You will be connected with a support specialist based on your chosen category (only 1 per session)"
     )
     if note:
         text = note + "\n\n" + text
@@ -499,7 +501,9 @@ async def send_user_menu(user_id: int, note: str | None = None):
 async def send_user_session_locked(user_id: int, category: str):
     text = (
         f"✅ Kamu sedang berada di sesi <b>{CATEGORY_LABEL.get(category, category)}</b>.\n"
-        f"Kalau mau pindah kategori lain, kamu harus <b>End Chat</b> dulu."
+        f"Kalau mau pindah kategori lain, kamu harus <b>End Chat</b> dulu.\n\n"
+        f"✅ You are currently in the <b>{CATEGORY_LABEL.get(category, category)}</b> session.\n"
+        f"If you want to switch to another category, you must <b>End Chat</b> first."
     )
     msg = await bot.send_message(user_id, text, reply_markup=kb_user_endchat())
     await index_message(user_id, "system", user_id, msg.message_id, "user_bot")
@@ -510,10 +514,10 @@ async def send_user_ban_notice(user_id: int, ban: dict):
     reason = ban["reason"]
     msg = await bot.send_message(
         user_id,
-        "⛔ <b>Kamu sedang diblok selama 1 hari</b>\n"
-        f"Alasan: <i>{reason}</i>\n"
-        f"Selesai: <b>{fmt_dt(until)}</b>\n"
-        f"Sisa waktu: <b>{human_remaining(until)}</b>",
+        "⛔ <b>You are currently banned for 1 day</b>\n"
+        f"Reason: <i>{reason}</i>\n"
+        f"Ends on: <b>{fmt_dt(until)}</b>\n"
+        f"Remaining time: <b>{human_remaining(until)}</b>",
     )
     await index_message(user_id, "system", user_id, msg.message_id, "user_bot")
 
@@ -584,14 +588,14 @@ async def pick_category(q: CallbackQuery):
     # cek session lock
     active = await get_user_category(user_id)
     if active:
-        await q.answer("Kamu masih punya sesi aktif. End Chat dulu.", show_alert=True)
+        await q.answer("Kamu masih punya sesi aktif. End Chat dulu. You have an active session in progress. You must End Chat first.", show_alert=True)
         await send_user_session_locked(user_id, active)
         return
 
     # cek ban
     ban = await get_active_ban(user_id)
     if ban:
-        await q.answer("Kamu sedang diblok sementara.", show_alert=True)
+        await q.answer("Kamu sedang diblok sementara. You are currently temporarily banned.", show_alert=True)
         await send_user_ban_notice(user_id, ban)
         return
 
@@ -604,8 +608,10 @@ async def pick_category(q: CallbackQuery):
 
     msg = await bot.send_message(
         user_id,
-        f"✅ Oke! Kamu masuk ke <b>{CATEGORY_LABEL.get(category, category)}</b>.\n"
-        "Silakan tulis pesan kamu. Jika sudah selesai, tekan <b>End Chat</b>.",
+        f"✅ Halo, sekarang kamu terhubung dengan <b>{CATEGORY_LABEL.get(category, category)}</b>.\n"
+        "Silakan tulis pesan kamu. Jika sudah selesai, tekan <b>End Chat</b>.\n\n"
+        "✅ Hello, you are now connected to <b>{CATEGORY_LABEL.get(category, category)}</b>.\n"
+        "Please type your message. Once you're done, press <b>End Chat</b>.",
         reply_markup=kb_user_endchat()
     )
     await index_message(user_id, category, user_id, msg.message_id, "user_bot")
